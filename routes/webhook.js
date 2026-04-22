@@ -4,7 +4,6 @@ const axios = require("axios");
 const sendMail = require("../utils/sendMail");
 const spokenToEmail = require("../utils/spokenToEmail");
 const { sanitizeString, sanitizeObject } = require("../utils/sanitize");
-const { extractWithOpenAI } = require("../utils/extractWithOpenAI");
 const https = require("https");
 const agent = new https.Agent({ rejectUnauthorized: false });
 
@@ -56,94 +55,35 @@ const schedEndTime = formatDateTime(end);
 
     conversationDueration = formatDuration(conversationDueration);
 
-    // Extract data from transcript using OpenAI
-    console.log("🤖 Extracting data from transcript using OpenAI...");
-    let extractedFields = await extractWithOpenAI(transcriptedData, telephoneData);
-    
-    console.log("📊 Extracted Fields:", extractedFields);
-    
-    // Extract and sanitize individual fields
-    let user_name = sanitizeString(extractedFields?.user_name || "Guest");
-    let mobile = sanitizeString(extractedFields?.mobile || telephoneData?.to_number || "");
-    let pincode = sanitizeString(extractedFields?.pincode || "");
-    let service_appointment_date = extractedFields?.service_appointment_date || new Date().toISOString();
-    let issuedesc = sanitizeString(extractedFields?.issueDesc || "Service Appointment");
-    let fulladdress = sanitizeString(extractedFields?.fullAddress || "");
-    let registration_number = sanitizeString(extractedFields?.registration_number || "");
-    
-    console.log("🔍 Final Sanitized Fields:", {
-      user_name,
-      mobile,
-      pincode,
-      service_appointment_date,
-      issuedesc,
-      fulladdress,
-      registration_number,
-    });
-    
-    let recordingURL = telephoneData?.recording_url || '';
-    const technician_visit_date = service_appointment_date || new Date().toISOString();
-    let issueDesc = issuedesc;
-    let fullAddress = fulladdress;
-    
-    let predDate = new Date(technician_visit_date).toLocaleString();
-
-    const dateObj = new Date(technician_visit_date);
-
-// YYYY-MM-DD
-const preferred_date = dateObj.toISOString().split("T")[0];
-
-// hh:mm AM/PM
-let hours = dateObj.getHours();
-let minutes = dateObj.getMinutes().toString().padStart(2, "0");
-const ampm = hours >= 12 ? "PM" : "AM";
-hours = hours % 12 || 12;
-
-const preferred_time = `${hours}:${minutes} ${ampm}`;
-    //step 0 to classify the subject of salesforce case
-    const classifyIssueType = (desc) => {
-      if (!desc) return "Service Appointment";
-
-      const serviceKeywords = [
-        "not working",
-        "leak",
-        "water leaking",
-        "kharab",
-        "repair",
-        "ac not working",
-        "washing machine not working",
-        "issue",
-        "problem",
-      ];
-
-      const complaintKeywords = [
-        "complaint",
-        "rude",
-        "delay",
-        "wrong",
-        "poor",
-        "service complaint",
-        "technician complaint",
-      ];
-
-      const lowerDesc = desc.toLowerCase();
-
-      // Match complaint first (more specific)
-      if (complaintKeywords.some((word) => lowerDesc.includes(word))) {
-        return "Complaint";
+    // 🤖 Helper to extract nested keys from Bolna JSON safely
+    const findField = (obj, key) => {
+      if (!obj || typeof obj !== 'object') return null;
+      if (obj[key] !== undefined && obj[key] !== null) return obj[key];
+      for (let k in obj) {
+        let res = findField(obj[k], key);
+        if (res !== null) return res;
       }
-
-      // Match service-related words
-      if (serviceKeywords.some((word) => lowerDesc.includes(word))) {
-        return "Service Appointment";
-      }
-
-      // Default
-      return "Service Appointment";
+      return null;
     };
 
-    const caseType = classifyIssueType(issueDesc);
-    console.log("🧠 Case Type:", caseType);
+    console.log("🤖 Extracting custom fields directly from Bolna data...");
+    let user_name = sanitizeString(findField(extracted, "name") || "Guest");
+    let feedback = sanitizeString(findField(extracted, "feedback") || "No feedback");
+    let rate = sanitizeString(findField(extracted, "rate") || "0");
+    let mobile = sanitizeString(telephoneData?.to_number || "");
+    
+    console.log(" Final Extracted Fields from Bolna:", { user_name, feedback, rate, mobile });
+
+    let recordingURL = telephoneData?.recording_url || '';
+    let caseType = "Customer Feedback";
+    
+    // Fallbacks for older variables so email/whatsapp don't crash
+    let predDate = new Date().toLocaleString();
+    let fullAddress = "Not Provided";
+    let registration_number = "Not Provided";
+    let issueDesc = feedback;
+    let pincode = "";
+    let technician_visit_date = new Date().toISOString();
 
     //Step 1 to Create Case in Salesforce
     
@@ -154,15 +94,14 @@ const preferred_time = `${hours}:${minutes} ${ampm}`;
       operation: "insert",
       user_name: user_name,
       Mobile: mobile,
-      Pincode: pincode,
-      issuedesc: issueDesc,
-      fulladdress: fullAddress,
+          feedback: feedback,
+          rate: rate,
       email: " ",
       preferred_date: predDate,
       recording_link: recordingURL,
       transcript: transcriptedData,
       conversationDueration: conversationDueration,
-      sentiment: "Neutral",
+          sentiment: rate,
       Origin: "Phone",
       Priority: "High"
     }, null, 2));
@@ -175,15 +114,14 @@ const preferred_time = `${hours}:${minutes} ${ampm}`;
         operation: "insert",
         user_name: user_name,
         Mobile: mobile,
-        Pincode: pincode,
-        issuedesc: issueDesc,
-        fulladdress: fullAddress,
+            feedback: feedback,
+            rate: rate,
         email: "aman.kumar@crmlanding.in",
         preferred_date: predDate,
         recording_link: recordingURL,
         transcript: transcriptedData,
         conversationDueration: conversationDueration,
-        sentiment: "Neutral",
+            sentiment: rate,
         Origin: "Phone",
         Priority: "High"
       },

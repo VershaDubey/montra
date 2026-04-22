@@ -44,11 +44,6 @@ app.get("/config", (req, res) => {
     message: "Environment Configuration Status",
     environment_vars: {
       PORT:                  process.env.PORT                  ? "✅ Set"                                 : "❌ Missing",
-      SF_INSTANCE_URL:       process.env.SF_INSTANCE_URL       ? `✅ Set: ${process.env.SF_INSTANCE_URL}` : "❌ Missing",
-      SF_CLIENT_ID:          process.env.SF_CLIENT_ID          ? "✅ Set"                                 : "❌ Missing",
-      SF_CLIENT_SECRET:      process.env.SF_CLIENT_SECRET      ? "✅ Set"                                 : "❌ Missing",
-      SF_USERNAME:           process.env.SF_USERNAME           ? `✅ Set: ${process.env.SF_USERNAME}`     : "❌ Missing — ADD on Render",
-      SF_PASSWORD:           process.env.SF_PASSWORD           ? "✅ Set"                                 : "❌ Missing — ADD on Render",
       SF_ACCESS_TOKEN:       process.env.SF_ACCESS_TOKEN       ? "✅ Set (dynamic)"                      : "⚠️ Will be fetched at runtime",
       WHATSAPP_ACCESS_TOKEN: process.env.WHATSAPP_ACCESS_TOKEN ? "✅ Set"                                 : "❌ Missing",
       EMAIL_USER:            process.env.EMAIL_USER            ? "✅ Set"                                 : "❌ Missing",
