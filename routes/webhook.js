@@ -23,16 +23,80 @@ function getWebhookDedupKey(body) {
   const providerCallId = String(body?.telephony_data?.provider_call_id || "").trim();
   const webhookId = String(body?.id || "").trim();
   const toNumber = String(body?.telephony_data?.to_number || "").trim();
-  const duration = String(body?.conversation_duration || "").trim();
+  const fromNumber = String(body?.telephony_data?.from_number || "").trim();
+  const duration = String(body?.conversation_duration || body?.telephony_data?.duration || "").trim();
+  const recordingUrl = String(body?.telephony_data?.recording_url || body?.recording_url || "").trim();
 
   if (providerCallId) return `provider_call_id:${providerCallId}`;
+  if (recordingUrl && toNumber) return `recording:${toNumber}:${recordingUrl}`;
   if (webhookId) return `webhook_id:${webhookId}`;
-  if (toNumber && duration) return `fallback:${toNumber}:${duration}`;
+  if (toNumber && fromNumber && duration) return `fallback:${toNumber}:${fromNumber}:${duration}`;
   return null;
+}
+
+function findField(obj, key) {
+  if (!obj || typeof obj !== "object") return null;
+  if (obj[key] !== undefined && obj[key] !== null && String(obj[key]).trim() !== "") return obj[key];
+
+  for (const nestedKey in obj) {
+    const result = findField(obj[nestedKey], key);
+    if (result !== null) return result;
+  }
+
+  return null;
+}
+
+function findFirstField(obj, keys = []) {
+  for (const key of keys) {
+    const value = findField(obj, key);
+    if (value !== null && value !== undefined && String(value).trim() !== "") {
+      return value;
+    }
+  }
+  return "";
+}
+
+function extractNameFromTranscript(transcript = "") {
+  if (!transcript) return "";
+  const match = transcript.match(/(?:my\s+name\s+is|मेरा\s+नाम|naam|name\s+is)\s*[:\-]?\s*([a-zA-Z\u0900-\u097F ]{2,40})/i);
+  return match?.[1] ? match[1].trim() : "";
+}
+
+function extractRateFromTranscript(transcript = "") {
+  if (!transcript) return "";
+
+  const patternMatch = transcript.match(/(?:rate|rating|रेटिंग|रेट|i\s+give|main\s+det[ae]\s+hu)\D*([1-5])\b/i);
+  if (patternMatch?.[1]) return patternMatch[1];
+
+  const lastUserLine = transcript
+    .split("\n")
+    .filter((line) => /^user\s*:/i.test(line))
+    .slice(-3)
+    .join(" ");
+
+  const simpleDigitMatch = lastUserLine.match(/\b([1-5])\b/);
+  return simpleDigitMatch?.[1] || "";
+}
+
+function extractFeedbackFromTranscript(transcript = "") {
+  if (!transcript) return "";
+
+  const userLines = transcript
+    .split("\n")
+    .filter((line) => /^user\s*:/i.test(line))
+    .map((line) => line.replace(/^user\s*:\s*/i, "").trim())
+    .filter((line) => line.length > 2);
+
+  if (!userLines.length) return "";
+
+  const preferred = userLines.find((line) => /(feedback|experience|service|accha|acha|bad|kharab|satisfied|unsatisfied|issue|problem|thanks)/i.test(line));
+  return sanitizeString(preferred || userLines[userLines.length - 1]);
 }
 
 router.post("/", async (req, res) => {
   let webhookDedupKey = null;
+  let sfCaseCreated = false;
+  let sfResponseData = null;
 
   try {
     // Sanitize incoming payload
@@ -64,13 +128,16 @@ router.post("/", async (req, res) => {
       processingWebhookKeys.add(webhookDedupKey);
     }
 
-    const extracted = sanitizedBody.extracted_data;
-    const telephoneData = sanitizedBody.telephony_data;
-    const transcriptedData = sanitizedBody.transcript;
-    let conversationDueration = sanitizedBody.conversation_duration;
+    const extracted = sanitizedBody.extracted_data || {};
+    const telephoneData = sanitizedBody.telephony_data || {};
+    const rawTranscript = typeof req.body?.transcript === "string" ? req.body.transcript : "";
+    const transcriptForExtraction = rawTranscript || sanitizedBody.transcript || findFirstField(extracted, ["transcript", "call_transcript"]) || "";
+    const transcriptedData = sanitizeString(transcriptForExtraction);
+    let conversationDueration = sanitizedBody.conversation_duration || telephoneData?.duration || 0;
 
     function formatDuration(seconds) {
-      const totalMilliseconds = Math.floor(seconds * 1000);
+      const safeSeconds = Number(seconds) || 0;
+      const totalMilliseconds = Math.floor(safeSeconds * 1000);
 
       const minutes = Math.floor(totalMilliseconds / 60000);
       const remainingAfterMinutes = totalMilliseconds % 60000;
@@ -87,77 +154,92 @@ router.post("/", async (req, res) => {
     }
 
     function formatDateTime(date) {
-  const year = date.getFullYear();
-  const month = (date.getMonth() + 1).toString().padStart(2, "0");
-  const day = date.getDate().toString().padStart(2, "0");
-  const hours = date.getHours().toString().padStart(2, "0");
-  const minutes = date.getMinutes().toString().padStart(2, "0");
+      const year = date.getFullYear();
+      const month = (date.getMonth() + 1).toString().padStart(2, "0");
+      const day = date.getDate().toString().padStart(2, "0");
+      const hours = date.getHours().toString().padStart(2, "0");
+      const minutes = date.getMinutes().toString().padStart(2, "0");
 
-  return `${year}-${month}-${day} ${hours}:${minutes}:00`;
-}
+      return `${year}-${month}-${day} ${hours}:${minutes}:00`;
+    }
 
-// current time
-const now = new Date();
-const schedStartTime = formatDateTime(now);
+    // current time
+    const now = new Date();
+    const schedStartTime = formatDateTime(now);
 
-// add 6 hours
-const end = new Date(now.getTime() + 6 * 60 * 60 * 1000);
-const schedEndTime = formatDateTime(end);
+    // add 6 hours
+    const end = new Date(now.getTime() + 6 * 60 * 60 * 1000);
+    const schedEndTime = formatDateTime(end);
 
     conversationDueration = formatDuration(conversationDueration);
 
-    // 🤖 Helper to extract nested keys from Bolna JSON safely
-    const findField = (obj, key) => {
-      if (!obj || typeof obj !== 'object') return null;
-      if (obj[key] !== undefined && obj[key] !== null) return obj[key];
-      for (let k in obj) {
-        let res = findField(obj[k], key);
-        if (res !== null) return res;
-      }
-      return null;
-    };
-
     console.log("🤖 Extracting custom fields directly from Bolna data...");
-    let user_name = sanitizeString(findField(extracted, "name") || "Guest");
-    let feedback = sanitizeString(findField(extracted, "feedback") || "No feedback");
-    let rate = sanitizeString(findField(extracted, "rate") || "0");
-    let mobile = sanitizeString(telephoneData?.to_number || "");
-    
-    console.log(" Final Extracted Fields from Bolna:", { user_name, feedback, rate, mobile });
+    let user_name = sanitizeString(
+      findFirstField(extracted, ["user_name", "name", "customer_name", "caller_name"]) || extractNameFromTranscript(transcriptForExtraction) || "Guest"
+    );
+    let feedback = sanitizeString(
+      findFirstField(extracted, ["feedback", "user_feedback", "issueDesc", "issue", "comment", "comments", "query", "summary"]) ||
+        extractFeedbackFromTranscript(transcriptForExtraction) ||
+        "No feedback"
+    );
+    let rate = sanitizeString(
+      findFirstField(extracted, ["rate", "rating", "score", "sentiment"]) || extractRateFromTranscript(transcriptForExtraction) || "0"
+    );
+    let mobile = sanitizeString(telephoneData?.to_number || findFirstField(extracted, ["mobile", "phone", "phone_number"]) || "");
 
-    let recordingURL = telephoneData?.recording_url || '';
+    let email = sanitizeString(findFirstField(extracted, ["email", "email_id", "mail"]));
+    if (email) {
+      email = spokenToEmail(email);
+    }
+
+    console.log(" Final Extracted Fields from Bolna:", {
+      user_name,
+      feedback,
+      rate,
+      mobile,
+      email,
+      transcript_length: transcriptedData.length,
+    });
+
+    let recordingURL = sanitizeString(telephoneData?.recording_url || sanitizedBody?.recording_url || findFirstField(extracted, ["recording_url", "recording_link"]) || "");
     let caseType = "Customer Feedback";
-    
+
     // Fallbacks for older variables so email/whatsapp don't crash
     let predDate = new Date().toLocaleString();
-    let fullAddress = "Not Provided";
-    let registration_number = "Not Provided";
+    let fullAddress = sanitizeString(findFirstField(extracted, ["fullAddress", "full_address", "address"]) || "Not Provided");
+    let registration_number = sanitizeString(findFirstField(extracted, ["registration_number", "vehicle_number", "reg_number"]) || "Not Provided");
     let issueDesc = feedback;
-    let pincode = "";
-    let technician_visit_date = new Date().toISOString();
+    let pincode = sanitizeString(findFirstField(extracted, ["pincode", "pin_code", "zip_code"]) || "");
+    let technician_visit_date = sanitizeString(findFirstField(extracted, ["technician_visit_date", "service_appointment_date"]) || new Date().toISOString());
 
-    //Step 1 to Create Case in Salesforce
-    
+    // Step 1 to Create Case in Salesforce
+
     // Print extracted data before Salesforce API call
     console.log("\n✅ EXTRACTED DATA TO SEND:");
-    console.log(JSON.stringify({
-      Subject: caseType,
-      operation: "insert",
-      user_name: user_name,
-      Mobile: mobile,
+    console.log(
+      JSON.stringify(
+        {
+          Subject: caseType,
+          operation: "insert",
+          user_name: user_name,
+          Mobile: mobile,
           feedback: feedback,
           rate: rate,
-      email: " ",
-      preferred_date: predDate,
-      recording_link: recordingURL,
-      transcript: transcriptedData,
-      conversationDueration: conversationDueration,
+          email: email,
+          preferred_date: predDate,
+          recording_link: recordingURL,
+          transcript: transcriptedData,
+          conversationDueration: conversationDueration,
           sentiment: rate,
-      Origin: "Phone",
-      Priority: "High"
-    }, null, 2));
+          Origin: "Phone",
+          Priority: "High",
+        },
+        null,
+        2
+      )
+    );
     console.log("\n");
-    
+
     const sfResponse = await axios.post(
       "https://orgfarm-eb022cf662-dev-ed.develop.my.salesforce.com/services/apexrest/caseService",
       {
@@ -165,30 +247,38 @@ const schedEndTime = formatDateTime(end);
         operation: "insert",
         user_name: user_name,
         Mobile: mobile,
-            feedback: feedback,
-            rate: rate,
-        email: "aman.kumar@crmlanding.in",
+        feedback: feedback,
+        rate: rate,
+        email: email,
         preferred_date: predDate,
         recording_link: recordingURL,
         transcript: transcriptedData,
         conversationDueration: conversationDueration,
-            sentiment: rate,
+        sentiment: rate,
         Origin: "Phone",
-        Priority: "High"
+        Priority: "High",
       },
       {
         headers: {
           Authorization: `Bearer ${process.env.SF_ACCESS_TOKEN}`,
           "Content-Type": "application/json",
-          Cookie: "BrowserId=7spVeGDlEfCCMxkfpbgyRg; CookieConsentPolicy=0:1; LSKey-c$CookieConsentPolicy=0:1"
-        }
+          Cookie: "BrowserId=7spVeGDlEfCCMxkfpbgyRg; CookieConsentPolicy=0:1; LSKey-c$CookieConsentPolicy=0:1",
+        },
       }
     );
 
+    sfCaseCreated = true;
+    sfResponseData = sfResponse.data;
+
+    // Mark as processed immediately after Salesforce case creation.
+    // This prevents duplicate case creation on webhook retries when downstream notifications fail.
+    if (webhookDedupKey) {
+      processedWebhookKeys.set(webhookDedupKey, Date.now());
+    }
+
     console.log("Salesforce Case created:", sfResponse.data);
 
-    const caseId = 'SR-'+ (sfResponse.data.caseNumber || 'PENDING'); // Fallback if no case number
-    const email = sanitizeString(sfResponse?.data?.email || "");
+    const caseId = "SR-" + (sfResponse.data.caseNumber || "PENDING"); // Fallback if no case number
     const issueDescription = issueDesc || "Service Request";
     const registeredAddress = fullAddress || "Address to be updated"; // Fallback address
     const serviceTime = new Date(technician_visit_date).toLocaleString("en-IN", {
@@ -201,9 +291,9 @@ const schedEndTime = formatDateTime(end);
       hour12: true,
     });
 
-    //step 2 to send email to customer
+    // step 2 to send email to customer
 
-   const emailHTML = `
+    const emailHTML = `
   <h2 style="color: #004d40;">Greaves Electric Mobility – Service Update</h2>
 
   <p>Dear ${user_name},</p>
@@ -228,84 +318,81 @@ const schedEndTime = formatDateTime(end);
   <p style="margin-top: 30px;">Regards,<br/><b>Greaves Electric Mobility Support Team</b></p>
 `;
 
-    // Only send email if we have a valid email address
-    let emailResponse = { success: true };
-    if (email && email.includes('@')) {
+    // Only send email if we have a valid customer email address
+    let emailResponse = { success: true, skipped: true };
+    if (email && email.includes("@")) {
       emailResponse = await sendMail({
         to: email,
         subject: `Greaves Electric Mobility – Service Update — Case ${caseId}`,
         html: emailHTML,
       });
     } else {
-      console.log("⚠️ Skipping email: No valid email address provided");
+      console.log("⚠️ Skipping email: No valid customer email address provided");
     }
 
-    //step 3 to send whatsapp message to customer
+    // step 3 to send whatsapp message to customer
 
-const parameters = [
-  `${user_name}`,
-  `${predDate}`,
-  `${registeredAddress}`,
-  `${registration_number}`,
-  `${issueDesc}`
-];
-    const whatsappMobile = mobile.replace(/^(\+91|91)/, '');
+    const parameters = [`${user_name}`, `${predDate}`, `${registeredAddress}`, `${registration_number}`, `${issueDesc}`];
+    const whatsappMobile = mobile.replace(/^(\+91|91)/, "");
     const whatsappPayload = {
-      "messaging_product": "whatsapp",
-      "to": "91" + whatsappMobile,
-      "type": "template",
-      "template": {
-        "name": "greaves_service_demo",
-        "language": { "code": "en" },
-        "components": [
+      messaging_product: "whatsapp",
+      to: "91" + whatsappMobile,
+      type: "template",
+      template: {
+        name: "greaves_service_demo",
+        language: { code: "en" },
+        components: [
           {
-            "type": "body",
-            "parameters": parameters.map((text) => ({ type: "text", text })),
+            type: "body",
+            parameters: parameters.map((text) => ({ type: "text", text })),
           },
         ],
       },
     };
 
-
-    const whatsappResponse = await axios.post(
-      "https://graph.facebook.com/v22.0/475003915704924/messages",
-      whatsappPayload,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
-          "Content-Type": "application/json",
-          "Accept-Encoding": "identity",
-
-        },
-      }
-    );
-console.log("WhatsApp message sent:", whatsappResponse.data);
-
-    if (webhookDedupKey) {
-      processedWebhookKeys.set(webhookDedupKey, Date.now());
-    }
+    const whatsappResponse = await axios.post("https://graph.facebook.com/v22.0/475003915704924/messages", whatsappPayload, {
+      headers: {
+        Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        "Accept-Encoding": "identity",
+      },
+    });
+    console.log("WhatsApp message sent:", whatsappResponse.data);
 
     res.status(200).json({
       success: true,
       message: "Salesforce Case created, and WhatsApp message delivered",
       salesforceResponse: sfResponse.data,
       whatsappResponse: whatsappResponse.data,
-      schedStartTime: schedStartTime,       
-    schedEndTime: schedEndTime    
+      emailResponse,
+      schedStartTime: schedStartTime,
+      schedEndTime: schedEndTime,
     });
   } catch (error) {
     console.error("❌ Webhook error:", error);
-    
+
     // Extract meaningful error message
     let errorMessage = error.message;
     let errorDetails = null;
-    
+
     if (error.response?.data) {
       errorDetails = error.response.data;
     } else if (error.message) {
       errorMessage = error.message;
     }
-    
+
+    // If Salesforce case is already created, avoid retry-triggered duplicate case creation.
+    if (sfCaseCreated) {
+      return res.status(200).json({
+        success: true,
+        message: "Salesforce case created, but downstream notification failed",
+        salesforceResponse: sfResponseData,
+        warning: errorMessage,
+        details: errorDetails || null,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     res.status(500).json({
       success: false,
       error: errorMessage,
