@@ -1,0 +1,27 @@
+📤 Sending webhook request...
+Payload size: 3595 bytes
+
+✅ Response Status: 500
+Response Headers: {
+  'x-powered-by': 'Express',
+  'access-control-allow-origin': '*',
+  'content-type': 'application/json; charset=utf-8',
+  'content-length': '188',
+  etag: 'W/"bc-qXyTLanbIXX3aO5lnh/U2uqZYs0"',
+  date: 'Tue, 07 Apr 2026 09:29:53 GMT',
+  connection: 'keep-alive',
+  'keep-alive': 'timeout=5'
+}
+
+📊 Response Body:
+{
+  "success": false,
+  "error": "Request failed with status code 401",
+  "details": [
+    {
+      "message": "Session expired or invalid",
+      "errorCode": "INVALID_SESSION_ID"
+    }
+  ],
+  "timestamp": "2026-04-07T09:29:53.856Z"
+}
