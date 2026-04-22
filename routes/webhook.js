@@ -6,12 +6,63 @@ const spokenToEmail = require("../utils/spokenToEmail");
 const { sanitizeString, sanitizeObject } = require("../utils/sanitize");
 const https = require("https");
 const agent = new https.Agent({ rejectUnauthorized: false });
+const processedWebhookKeys = new Map();
+const processingWebhookKeys = new Set();
+const WEBHOOK_DEDUPE_TTL_MS = Number(process.env.WEBHOOK_DEDUPE_TTL_MS || 6 * 60 * 60 * 1000);
+
+function clearExpiredProcessedWebhookKeys() {
+  const now = Date.now();
+  for (const [key, timestamp] of processedWebhookKeys.entries()) {
+    if (now - timestamp > WEBHOOK_DEDUPE_TTL_MS) {
+      processedWebhookKeys.delete(key);
+    }
+  }
+}
+
+function getWebhookDedupKey(body) {
+  const providerCallId = String(body?.telephony_data?.provider_call_id || "").trim();
+  const webhookId = String(body?.id || "").trim();
+  const toNumber = String(body?.telephony_data?.to_number || "").trim();
+  const duration = String(body?.conversation_duration || "").trim();
+
+  if (providerCallId) return `provider_call_id:${providerCallId}`;
+  if (webhookId) return `webhook_id:${webhookId}`;
+  if (toNumber && duration) return `fallback:${toNumber}:${duration}`;
+  return null;
+}
 
 router.post("/", async (req, res) => {
+  let webhookDedupKey = null;
+
   try {
     // Sanitize incoming payload
     const sanitizedBody = sanitizeObject(req.body);
     console.log("📦 Webhook received payload:", JSON.stringify(sanitizedBody, null, 2));
+
+    clearExpiredProcessedWebhookKeys();
+    webhookDedupKey = getWebhookDedupKey(sanitizedBody);
+
+    if (webhookDedupKey && processedWebhookKeys.has(webhookDedupKey)) {
+      console.log(`🔁 Duplicate webhook ignored (already processed): ${webhookDedupKey}`);
+      return res.status(200).json({
+        success: true,
+        message: "Duplicate webhook ignored",
+        dedupe_key: webhookDedupKey,
+      });
+    }
+
+    if (webhookDedupKey && processingWebhookKeys.has(webhookDedupKey)) {
+      console.log(`⏳ Duplicate webhook ignored (processing in progress): ${webhookDedupKey}`);
+      return res.status(202).json({
+        success: true,
+        message: "Webhook already processing",
+        dedupe_key: webhookDedupKey,
+      });
+    }
+
+    if (webhookDedupKey) {
+      processingWebhookKeys.add(webhookDedupKey);
+    }
 
     const extracted = sanitizedBody.extracted_data;
     const telephoneData = sanitizedBody.telephony_data;
@@ -137,7 +188,7 @@ const schedEndTime = formatDateTime(end);
     console.log("Salesforce Case created:", sfResponse.data);
 
     const caseId = 'SR-'+ (sfResponse.data.caseNumber || 'PENDING'); // Fallback if no case number
-    const email = sfResponse.data.email || user_name + '@greaves.com' || 'support@greaves.com'; // Provide default email
+    const email = sanitizeString(sfResponse?.data?.email || "");
     const issueDescription = issueDesc || "Service Request";
     const registeredAddress = fullAddress || "Address to be updated"; // Fallback address
     const serviceTime = new Date(technician_visit_date).toLocaleString("en-IN", {
@@ -229,6 +280,11 @@ const parameters = [
       }
     );
 console.log("WhatsApp message sent:", whatsappResponse.data);
+
+    if (webhookDedupKey) {
+      processedWebhookKeys.set(webhookDedupKey, Date.now());
+    }
+
     res.status(200).json({
       success: true,
       message: "Salesforce Case created, and WhatsApp message delivered",
@@ -256,6 +312,10 @@ console.log("WhatsApp message sent:", whatsappResponse.data);
       details: errorDetails || null,
       timestamp: new Date().toISOString(),
     });
+  } finally {
+    if (webhookDedupKey) {
+      processingWebhookKeys.delete(webhookDedupKey);
+    }
   }
 });
 
