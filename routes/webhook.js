@@ -56,6 +56,39 @@ function findFirstField(obj, keys = []) {
   return "";
 }
 
+function findAllFields(obj, key, acc = []) {
+  if (!obj || typeof obj !== "object") return acc;
+  if (obj[key] !== undefined && obj[key] !== null && String(obj[key]).trim() !== "") {
+    acc.push(obj[key]);
+  }
+  for (const nestedKey in obj) {
+    findAllFields(obj[nestedKey], key, acc);
+  }
+  return acc;
+}
+
+function getSubjectiveValue(subjectiveText = "", fieldKey = "") {
+  if (!subjectiveText || !fieldKey) return "";
+  const regex = new RegExp(`['"]${fieldKey}['"]\\s*:\\s*['"]([^'"]+)['"]`, "i");
+  const match = subjectiveText.match(regex);
+  return match?.[1] ? match[1].trim() : "";
+}
+
+function getSubjectiveExtraction(extracted = {}) {
+  const subjectiveCandidates = findAllFields(extracted, "subjective");
+  for (const candidate of subjectiveCandidates) {
+    const text = String(candidate || "").trim();
+    if (!text) continue;
+    const user_name = getSubjectiveValue(text, "user_name");
+    const feedback = getSubjectiveValue(text, "feedback");
+    const rate = getSubjectiveValue(text, "rate");
+    if (user_name || feedback || rate) {
+      return { user_name, feedback, rate };
+    }
+  }
+  return { user_name: "", feedback: "", rate: "" };
+}
+
 function extractNameFromTranscript(transcript = "") {
   if (!transcript) return "";
   const match = transcript.match(/(?:my\s+name\s+is|मेरा\s+नाम|naam|name\s+is)\s*[:\-]?\s*([a-zA-Z\u0900-\u097F ]{2,40})/i);
@@ -65,8 +98,26 @@ function extractNameFromTranscript(transcript = "") {
 function extractRateFromTranscript(transcript = "") {
   if (!transcript) return "";
 
-  const patternMatch = transcript.match(/(?:rate|rating|रेटिंग|रेट|i\s+give|main\s+det[ae]\s+hu)\D*([1-5])\b/i);
+  const patternMatch = transcript.match(/(?:rate|rating|रेटिंग|रेट|i\s+give|main\s+det[ae]\s+hu)\D*([1-9]|10)\b/i);
   if (patternMatch?.[1]) return patternMatch[1];
+
+  const hindiOutOfTenMatch = transcript.match(/दस\s+में\s+से\s+(एक|दो|तीन|चार|पांच|पाँच|छह|सात|आठ|नौ|दस)/i);
+  if (hindiOutOfTenMatch?.[1]) {
+    const map = {
+      एक: "1",
+      दो: "2",
+      तीन: "3",
+      चार: "4",
+      पांच: "5",
+      "पाँच": "5",
+      छह: "6",
+      सात: "7",
+      आठ: "8",
+      नौ: "9",
+      दस: "10",
+    };
+    return map[hindiOutOfTenMatch[1]] || "";
+  }
 
   const lastUserLine = transcript
     .split("\n")
@@ -74,7 +125,7 @@ function extractRateFromTranscript(transcript = "") {
     .slice(-3)
     .join(" ");
 
-  const simpleDigitMatch = lastUserLine.match(/\b([1-5])\b/);
+  const simpleDigitMatch = lastUserLine.match(/\b([1-9]|10)\b/);
   return simpleDigitMatch?.[1] || "";
 }
 
@@ -172,18 +223,26 @@ router.post("/", async (req, res) => {
     const schedEndTime = formatDateTime(end);
 
     conversationDueration = formatDuration(conversationDueration);
+    const subjectiveExtraction = getSubjectiveExtraction(extracted);
 
     console.log("🤖 Extracting custom fields directly from Bolna data...");
     let user_name = sanitizeString(
-      findFirstField(extracted, ["user_name", "name", "customer_name", "caller_name"]) || extractNameFromTranscript(transcriptForExtraction) || "Guest"
+      findFirstField(extracted, ["user_name", "name", "customer_name", "caller_name"]) ||
+        subjectiveExtraction.user_name ||
+        extractNameFromTranscript(transcriptForExtraction) ||
+        "Guest"
     );
     let feedback = sanitizeString(
       findFirstField(extracted, ["feedback", "user_feedback", "issueDesc", "issue", "comment", "comments", "query", "summary"]) ||
+        subjectiveExtraction.feedback ||
         extractFeedbackFromTranscript(transcriptForExtraction) ||
         "No feedback"
     );
     let rate = sanitizeString(
-      findFirstField(extracted, ["rate", "rating", "score", "sentiment"]) || extractRateFromTranscript(transcriptForExtraction) || "0"
+      findFirstField(extracted, ["rate", "rating", "score", "sentiment"]) ||
+        subjectiveExtraction.rate ||
+        extractRateFromTranscript(transcriptForExtraction) ||
+        "0"
     );
     let mobile = sanitizeString(telephoneData?.to_number || findFirstField(extracted, ["mobile", "phone", "phone_number"]) || "");
 
@@ -211,6 +270,17 @@ router.post("/", async (req, res) => {
     let issueDesc = feedback;
     let pincode = sanitizeString(findFirstField(extracted, ["pincode", "pin_code", "zip_code"]) || "");
     let technician_visit_date = sanitizeString(findFirstField(extracted, ["technician_visit_date", "service_appointment_date"]) || new Date().toISOString());
+    const transcriptForSalesforce = transcriptForExtraction ? String(transcriptForExtraction).slice(0, 31500) : "";
+    const caseDescription = [
+      `User: ${user_name || "NA"}`,
+      `Mobile: ${mobile || "NA"}`,
+      `Feedback: ${feedback || "NA"}`,
+      `Rate: ${rate || "NA"}`,
+      `Recording URL: ${recordingURL || "NA"}`,
+      "",
+      "Transcript:",
+      transcriptForSalesforce || "NA",
+    ].join("\n");
 
     // Step 1 to Create Case in Salesforce
 
@@ -228,9 +298,12 @@ router.post("/", async (req, res) => {
           email: email,
           preferred_date: predDate,
           recording_link: recordingURL,
-          transcript: transcriptedData,
+          recording_url: recordingURL,
+          transcript: transcriptForSalesforce,
+          call_transcript: transcriptForSalesforce,
           conversationDueration: conversationDueration,
           sentiment: rate,
+          Description: caseDescription,
           Origin: "Phone",
           Priority: "High",
         },
@@ -252,9 +325,12 @@ router.post("/", async (req, res) => {
         email: email,
         preferred_date: predDate,
         recording_link: recordingURL,
-        transcript: transcriptedData,
+        recording_url: recordingURL,
+        transcript: transcriptForSalesforce,
+        call_transcript: transcriptForSalesforce,
         conversationDueration: conversationDueration,
         sentiment: rate,
+        Description: caseDescription,
         Origin: "Phone",
         Priority: "High",
       },
